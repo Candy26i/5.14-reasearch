@@ -1,0 +1,368 @@
+"""Synthesize SFT data for the three subagents using a teacher LLM.
+
+Pipeline per sample:
+  1. Pick a benchmark example.
+  2. Build the teacher prompt for the target agent kind.
+  3. Call teacher (with disk cache).
+  4. Extract first JSON object from response.
+  5. Validate against pydantic schema.
+  6. Run leakage audit (rejects samples that mention GT label/text).
+  7. On any failure, retry up to N times with a slight temperature bump.
+  8. On final failure, log and skip.
+
+Each successful row is written as:
+  {
+    "example_id": int,
+    "benchmark_name": str,
+    "agent_kind": str,
+    "teacher_provider": str,
+    "teacher_model": str,
+    "prompt": [<chat messages for SUBAGENT runtime>],
+    "response": "<JSON string of validated schema>"
+  }
+
+The "prompt" field uses the RUNTIME system prompt, not the teacher prompt.
+This is what the subagent will be SFT'd to produce.
+"""
+from __future__ import annotations
+
+import json
+import os
+import random
+import re
+import time
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import ValidationError
+from tqdm import tqdm
+
+from ..benchmarks.base import StandardRow
+from ..teachers.base import TeacherClient, TeacherResponse
+from ..utils.cache import TeacherCallCache
+from ..utils.io import append_jsonl, write_json, write_jsonl
+from ..utils.leakage import LeakageAuditor
+
+from .prompts.extractor import build_extractor_synth_prompt
+from .prompts.reasoner import build_reasoner_synth_prompt
+from .prompts.rule_applier import build_rule_applier_synth_prompt
+from .prompts.runtime_prompts import build_runtime_messages
+from .schemas import (
+    AgentKind,
+    ExtractorOutput,
+    ReasonerOutput,
+    RuleApplierOutput,
+    SCHEMA_REGISTRY,
+)
+
+
+JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    s = text.find("{")
+    if s == -1:
+        return None
+    # Greedy outermost brace match — fine for our schemas which are flat.
+    e = text.rfind("}")
+    if e <= s:
+        return None
+    chunk = text[s : e + 1]
+    try:
+        obj = json.loads(chunk)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        # Try a regex fallback for nested-prose responses.
+        m = JSON_BLOCK_RE.search(text)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+
+def _build_teacher_prompt(
+    kind: AgentKind,
+    row: StandardRow,
+    show_gt: bool,
+) -> List[Dict[str, str]]:
+    if kind == AgentKind.EXTRACTOR:
+        # Extractor is GT-blind by design.
+        return build_extractor_synth_prompt(row.question, row.context, row.choices)
+    gt_for_teacher = row.ground_truth if show_gt else ""
+    if kind == AgentKind.REASONER:
+        return build_reasoner_synth_prompt(row.question, row.context, row.choices, gt_for_teacher)
+    if kind == AgentKind.RULE_APPLIER:
+        return build_rule_applier_synth_prompt(row.question, row.context, row.choices, gt_for_teacher)
+    raise ValueError(f"Unknown kind: {kind}")
+
+
+def _validate_schema(kind: AgentKind, obj: Dict[str, Any]):
+    schema_cls = SCHEMA_REGISTRY[kind]
+    return schema_cls(**obj)
+
+
+def _gt_audit_keywords(row: StandardRow) -> Dict[str, str]:
+    """Build keyword set for leakage audit."""
+    gt_label = row.ground_truth
+    gt_text = row.choices.get(row.ground_truth, "") if row.choices else ""
+    # Token form e.g. "ANSWER_B"
+    token_form = f"ANSWER_{gt_label.upper()}" if gt_label else ""
+    return {
+        "ground_truth_label": gt_label,
+        "ground_truth_text": gt_text,
+        "token_form": token_form,
+    }
+
+
+def _candidate_analysis_balance_check(
+    kind: AgentKind,
+    obj: Dict[str, Any],
+    row: StandardRow,
+) -> Tuple[bool, str]:
+    """For Reasoner output, ensure candidate_analysis covers all choices."""
+    if kind != AgentKind.REASONER:
+        return True, ""
+    if not row.choices:
+        return True, ""
+    ca = obj.get("candidate_analysis", [])
+    if not isinstance(ca, list):
+        return False, "candidate_analysis must be a list"
+    seen_keys = {str(item.get("choice_key", "")).strip() for item in ca if isinstance(item, dict)}
+    expected = set(row.choices.keys())
+    missing = expected - seen_keys
+    if missing:
+        return False, f"candidate_analysis missing keys: {sorted(missing)}"
+    return True, ""
+
+
+@dataclass
+class SynthStats:
+    requested: int = 0
+    succeeded: int = 0
+    json_parse_fail: int = 0
+    schema_fail: int = 0
+    leakage_fail: int = 0
+    balance_fail: int = 0
+    teacher_error: int = 0
+
+
+def _agent_default_max_tokens(kind: AgentKind) -> int:
+    if kind == AgentKind.EXTRACTOR:
+        return 1200
+    if kind == AgentKind.REASONER:
+        return 2200
+    if kind == AgentKind.RULE_APPLIER:
+        return 1800
+    return 1500
+
+
+def synthesize_subagent_data(
+    rows: List[StandardRow],
+    agent_kind: AgentKind,
+    teacher: TeacherClient,
+    out_path: str,
+    cache: Optional[TeacherCallCache] = None,
+    auditor: Optional[LeakageAuditor] = None,
+    show_gt: bool = True,
+    n_samples: int = 500,
+    base_temperature: float = 0.4,
+    max_retries_per_sample: int = 2,
+    seed: int = 42,
+    log_path: Optional[str] = None,
+) -> SynthStats:
+    """Synthesize SFT data for one subagent.
+
+    Args:
+        rows: Pool of benchmark rows to draw from.
+        agent_kind: Which subagent we are synthesizing for.
+        teacher: TeacherClient instance.
+        out_path: JSONL output path (one SFT sample per line).
+        cache: Optional teacher-call disk cache.
+        auditor: Optional leakage auditor (recommended).
+        show_gt: For Reasoner / RuleApplier, whether to pass GT to teacher.
+                 Extractor ignores this (always GT-blind).
+        n_samples: Target number of accepted samples.
+        base_temperature: Starting temperature; bumped on retry.
+        max_retries_per_sample: Number of retries before giving up on a row.
+        seed: Reproducibility seed for row sampling.
+        log_path: Optional JSONL path for per-attempt logs.
+    """
+    if auditor is None:
+        auditor = LeakageAuditor()
+
+    rng = random.Random(seed)
+    pool = list(rows)
+    rng.shuffle(pool)
+
+    stats = SynthStats(requested=n_samples)
+    accepted: List[Dict[str, Any]] = []
+    pool_idx = 0
+    progress = tqdm(total=n_samples, desc=f"synth/{agent_kind.value}", ncols=100)
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    # Truncate output file at start
+    with open(out_path, "w", encoding="utf-8"):
+        pass
+    if log_path:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        with open(log_path, "w", encoding="utf-8"):
+            pass
+
+    while len(accepted) < n_samples and pool_idx < len(pool):
+        row = pool[pool_idx]
+        pool_idx += 1
+
+        success_obj: Optional[Dict[str, Any]] = None
+        last_failure_reason = ""
+
+        for attempt in range(max_retries_per_sample + 1):
+            temperature = min(0.95, base_temperature + 0.15 * attempt)
+            messages = _build_teacher_prompt(agent_kind, row, show_gt=show_gt)
+
+            cache_key = None
+            cached_resp: Optional[Dict[str, Any]] = None
+            if cache is not None:
+                cache_key = TeacherCallCache.make_key(
+                    teacher.provider, teacher.model, messages, temperature
+                )
+                cached_resp = cache.get(cache_key)
+
+            if cached_resp is not None:
+                text = cached_resp.get("text", "")
+                resp_meta = {"cached": True, **cached_resp.get("raw", {})}
+            else:
+                try:
+                    resp: TeacherResponse = teacher.chat(
+                        messages,
+                        temperature=temperature,
+                        max_tokens=_agent_default_max_tokens(agent_kind),
+                    )
+                    text = resp.text
+                    resp_meta = {"cached": False, **(resp.raw or {})}
+                    if cache is not None and cache_key:
+                        cache.put(cache_key, {"text": text, "raw": resp.raw})
+                except Exception as e:
+                    stats.teacher_error += 1
+                    last_failure_reason = f"teacher_error: {e}"
+                    if log_path:
+                        append_jsonl(log_path, [{
+                            "ts": int(time.time()),
+                            "example_id": row.example_id,
+                            "agent_kind": agent_kind.value,
+                            "attempt": attempt,
+                            "error": last_failure_reason,
+                        }])
+                    continue
+
+            obj = _extract_first_json(text)
+            if obj is None:
+                stats.json_parse_fail += 1
+                last_failure_reason = "json_parse_fail"
+                if log_path:
+                    append_jsonl(log_path, [{
+                        "ts": int(time.time()),
+                        "example_id": row.example_id,
+                        "agent_kind": agent_kind.value,
+                        "attempt": attempt,
+                        "error": last_failure_reason,
+                        "text_preview": text[:400],
+                    }])
+                continue
+
+            try:
+                model = _validate_schema(agent_kind, obj)
+            except ValidationError as e:
+                stats.schema_fail += 1
+                last_failure_reason = f"schema_fail: {e.errors()[:2]}"
+                if log_path:
+                    append_jsonl(log_path, [{
+                        "ts": int(time.time()),
+                        "example_id": row.example_id,
+                        "agent_kind": agent_kind.value,
+                        "attempt": attempt,
+                        "error": "schema_fail",
+                    }])
+                continue
+
+            ok_balance, balance_msg = _candidate_analysis_balance_check(agent_kind, obj, row)
+            if not ok_balance:
+                stats.balance_fail += 1
+                last_failure_reason = f"balance_fail: {balance_msg}"
+                if log_path:
+                    append_jsonl(log_path, [{
+                        "ts": int(time.time()),
+                        "example_id": row.example_id,
+                        "agent_kind": agent_kind.value,
+                        "attempt": attempt,
+                        "error": last_failure_reason,
+                    }])
+                continue
+
+            kw = _gt_audit_keywords(row)
+            audit = auditor.audit(
+                generated=obj,
+                ground_truth_label=kw["ground_truth_label"],
+                ground_truth_text=kw["ground_truth_text"],
+                token_form=kw["token_form"],
+            )
+            if audit.leaked:
+                stats.leakage_fail += 1
+                last_failure_reason = f"leakage_fail: {audit.matches[:3]}"
+                if log_path:
+                    append_jsonl(log_path, [{
+                        "ts": int(time.time()),
+                        "example_id": row.example_id,
+                        "agent_kind": agent_kind.value,
+                        "attempt": attempt,
+                        "error": last_failure_reason,
+                    }])
+                continue
+
+            # Validated, balanced, no leakage. Use the validated dict.
+            success_obj = model.model_dump()
+            break
+
+        if success_obj is None:
+            continue
+
+        runtime_prompt = build_runtime_messages(
+            agent_kind=agent_kind.value,
+            question=row.question,
+            context=row.context,
+            choices=row.choices,
+        )
+        sft_row = {
+            "example_id": int(row.example_id),
+            "benchmark_name": row.benchmark_name,
+            "agent_kind": agent_kind.value,
+            "teacher_provider": teacher.provider,
+            "teacher_model": teacher.model,
+            "prompt": runtime_prompt,
+            "response": json.dumps(success_obj, ensure_ascii=False),
+        }
+        accepted.append(sft_row)
+        append_jsonl(out_path, [sft_row])
+        stats.succeeded += 1
+        progress.update(1)
+
+    progress.close()
+
+    # Sidecar metadata
+    meta_path = out_path + ".meta.json"
+    write_json(meta_path, {
+        "agent_kind": agent_kind.value,
+        "teacher_provider": teacher.provider,
+        "teacher_model": teacher.model,
+        "n_requested": n_samples,
+        "n_pool": len(pool),
+        "n_accepted": len(accepted),
+        "stats": asdict(stats),
+        "show_gt": bool(show_gt),
+    })
+
+    return stats
