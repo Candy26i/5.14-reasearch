@@ -3,7 +3,7 @@
 Design intent:
   - Extractor's job is OBJECTIVE evidence/fact extraction.
   - We do NOT show the teacher the ground truth label or the GT choice text.
-    Reason: leakage avoidance + we want the teacher to surface evidence on
+    Reason: leakage avCUD3909oidance + we want the teacher to surface evidence on
     BOTH sides (support and oppose), not only pro-GT evidence.
   - For MedQA (closed-book MCQ with empty context), we pivot the agent's
     role to "extract clinical facts from the question stem itself".
@@ -16,7 +16,7 @@ from typing import Dict, List
 
 _EXTRACTOR_TEACHER_SYSTEM = """You are an expert annotator producing training data for an Extractor sub-agent.
 
-The Extractor's job is to surface DECISION-RELEVANT SIGNALS that another agent will use to reason about an answer. The Extractor itself NEVER decides the final answer.
+The Extractor's job is to surface DECISION-RELEVANT SIGNALS that manager agent will use to reason about an answer. The Extractor itself NEVER decides the final answer.
 
 You will be given:
 - A QUESTION (and CHOICES, if multiple-choice)

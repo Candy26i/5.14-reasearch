@@ -23,6 +23,12 @@ from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
+    from peft import PeftModel
+    PEFT_AVAILABLE = True
+except Exception:
+    PEFT_AVAILABLE = False
+
+try:
     from trl import GRPOConfig, GRPOTrainer
     TRL_AVAILABLE = True
 except Exception:
@@ -175,6 +181,7 @@ class ManagerGRPOConfig:
     extractor_adapter: Optional[str]
     reasoner_adapter: Optional[str]
     rule_applier_adapter: Optional[str]
+    manager_adapter: Optional[str] = None
     fail_buffer_jsonl: Optional[str] = None
     raw_trace_jsonl: Optional[str] = None
     seed: int = 42
@@ -185,6 +192,7 @@ class ManagerGRPOConfig:
     grpo_beta: float = 0.01
     max_steps: int = -1
     routing_efficiency_bonus: float = 0.0
+    tool_use_bonus: float = 0.0
     binding_mode: str = "auto"           # auto | environment | argument
     use_wandb: bool = False
     wandb_project: str = "agent_routing"
@@ -285,7 +293,9 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
     train_dataset = Dataset.from_list(train_records)
 
     # ---- Manager model + tokenizer ----
-    manager_tok = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True)
+    manager_tok = AutoTokenizer.from_pretrained(
+        cfg.manager_adapter or cfg.base_model, trust_remote_code=True
+    )
     manager_tok.padding_side = "left"
     if manager_tok.pad_token_id is None and manager_tok.eos_token_id is not None:
         manager_tok.pad_token_id = manager_tok.eos_token_id
@@ -299,6 +309,13 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
     manager_model = AutoModelForCausalLM.from_pretrained(
         cfg.base_model, torch_dtype=dtype, trust_remote_code=True
     ).to(device)
+    if cfg.manager_adapter:
+        if not PEFT_AVAILABLE:
+            raise RuntimeError("peft is required to load --mgr_init_adapter.")
+        manager_model = PeftModel.from_pretrained(
+            manager_model, cfg.manager_adapter, is_trainable=True
+        ).to(device)
+        print(f"[MANAGER_GRPO] manager init adapter -> {cfg.manager_adapter}")
     manager_model.config.use_cache = False
     if not hasattr(manager_model, "warnings_issued") or manager_model.warnings_issued is None:
         manager_model.warnings_issued = {}
@@ -329,6 +346,7 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         fail_buffer_jsonl=fail_buffer,
         raw_trace_jsonl=raw_trace,
         routing_efficiency_bonus=cfg.routing_efficiency_bonus,
+        tool_use_bonus=cfg.tool_use_bonus,
         is_main_process=is_main,
     )
 
@@ -362,6 +380,8 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "binding_mode": binding_mode,
         "n_train_rows": len(cfg.rows),
         "subagents": sorted(pool._agents.keys()),
+        "manager_adapter": cfg.manager_adapter,
         "routing_efficiency_bonus": cfg.routing_efficiency_bonus,
+        "tool_use_bonus": cfg.tool_use_bonus,
     })
     print(f"[MANAGER_GRPO] saved -> {cfg.out_dir}")

@@ -88,16 +88,14 @@ def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
 def _build_teacher_prompt(
     kind: AgentKind,
     row: StandardRow,
-    show_gt: bool,
 ) -> List[Dict[str, str]]:
     if kind == AgentKind.EXTRACTOR:
         # Extractor is GT-blind by design.
         return build_extractor_synth_prompt(row.question, row.context, row.choices)
-    gt_for_teacher = row.ground_truth if show_gt else ""
     if kind == AgentKind.REASONER:
-        return build_reasoner_synth_prompt(row.question, row.context, row.choices, gt_for_teacher)
+        return build_reasoner_synth_prompt(row.question, row.context, row.choices)
     if kind == AgentKind.RULE_APPLIER:
-        return build_rule_applier_synth_prompt(row.question, row.context, row.choices, gt_for_teacher)
+        return build_rule_applier_synth_prompt(row.question, row.context, row.choices)
     raise ValueError(f"Unknown kind: {kind}")
 
 
@@ -119,24 +117,24 @@ def _gt_audit_keywords(row: StandardRow) -> Dict[str, str]:
     }
 
 
-def _candidate_analysis_balance_check(
+def _reasoner_choice_coverage_check(
     kind: AgentKind,
     obj: Dict[str, Any],
     row: StandardRow,
 ) -> Tuple[bool, str]:
-    """For Reasoner output, ensure candidate_analysis covers all choices."""
+    """For Reasoner output, ensure candidate_considerations covers all choices."""
     if kind != AgentKind.REASONER:
         return True, ""
     if not row.choices:
         return True, ""
-    ca = obj.get("candidate_analysis", [])
+    ca = obj.get("candidate_considerations", [])
     if not isinstance(ca, list):
-        return False, "candidate_analysis must be a list"
+        return False, "candidate_considerations must be a list"
     seen_keys = {str(item.get("choice_key", "")).strip() for item in ca if isinstance(item, dict)}
     expected = set(row.choices.keys())
     missing = expected - seen_keys
     if missing:
-        return False, f"candidate_analysis missing keys: {sorted(missing)}"
+        return False, f"candidate_considerations missing keys: {sorted(missing)}"
     return True, ""
 
 
@@ -168,7 +166,6 @@ def synthesize_subagent_data(
     out_path: str,
     cache: Optional[TeacherCallCache] = None,
     auditor: Optional[LeakageAuditor] = None,
-    show_gt: bool = True,
     n_samples: int = 500,
     base_temperature: float = 0.4,
     max_retries_per_sample: int = 2,
@@ -184,8 +181,8 @@ def synthesize_subagent_data(
         out_path: JSONL output path (one SFT sample per line).
         cache: Optional teacher-call disk cache.
         auditor: Optional leakage auditor (recommended).
-        show_gt: For Reasoner / RuleApplier, whether to pass GT to teacher.
-                 Extractor ignores this (always GT-blind).
+        All subagent teacher prompts are GT-blind. Ground truth is used only
+        for leakage auditing and downstream evaluation.
         n_samples: Target number of accepted samples.
         base_temperature: Starting temperature; bumped on retry.
         max_retries_per_sample: Number of retries before giving up on a row.
@@ -222,7 +219,7 @@ def synthesize_subagent_data(
 
         for attempt in range(max_retries_per_sample + 1):
             temperature = min(0.95, base_temperature + 0.15 * attempt)
-            messages = _build_teacher_prompt(agent_kind, row, show_gt=show_gt)
+            messages = _build_teacher_prompt(agent_kind, row)
 
             cache_key = None
             cached_resp: Optional[Dict[str, Any]] = None
@@ -289,7 +286,7 @@ def synthesize_subagent_data(
                     }])
                 continue
 
-            ok_balance, balance_msg = _candidate_analysis_balance_check(agent_kind, obj, row)
+            ok_balance, balance_msg = _reasoner_choice_coverage_check(agent_kind, obj, row)
             if not ok_balance:
                 stats.balance_fail += 1
                 last_failure_reason = f"balance_fail: {balance_msg}"
@@ -362,7 +359,7 @@ def synthesize_subagent_data(
         "n_pool": len(pool),
         "n_accepted": len(accepted),
         "stats": asdict(stats),
-        "show_gt": bool(show_gt),
+        "gt_visible_to_teacher": False,
     })
 
     return stats

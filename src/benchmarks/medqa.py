@@ -84,12 +84,27 @@ def _load_from_local(path: str) -> List[Dict[str, Any]]:
         raise FileNotFoundError(f"MedQA local path not found: {path}")
 
     file_specs = []
+    seen_files = set()
     for split_name in ("train", "dev", "validation", "test"):
+        candidates = []
         for ext in (".jsonl", ".json"):
-            fp = p / f"{split_name}{ext}"
-            if fp.exists():
-                norm = "dev" if split_name == "validation" else split_name
-                file_specs.append((norm, fp))
+            exact = p / f"{split_name}{ext}"
+            if exact.exists():
+                candidates.append(exact)
+
+        # Some MedQA releases name split files with a prefix, e.g.
+        # phrases_no_exclude_train.jsonl under US/4_options.
+        if not candidates:
+            for ext in (".jsonl", ".json"):
+                candidates.extend(sorted(p.glob(f"*_{split_name}{ext}")))
+
+        norm = "dev" if split_name == "validation" else split_name
+        for fp in candidates:
+            resolved = fp.resolve()
+            if resolved in seen_files:
+                continue
+            seen_files.add(resolved)
+            file_specs.append((norm, fp))
 
     if not file_specs:
         raise FileNotFoundError(f"No MedQA files under {path}")

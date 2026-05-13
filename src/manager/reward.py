@@ -112,6 +112,7 @@ def build_reward_funcs(
     fail_buffer_jsonl: Optional[str] = None,
     raw_trace_jsonl: Optional[str] = None,
     routing_efficiency_bonus: float = 0.0,
+    tool_use_bonus: float = 0.0,
     is_main_process: bool = True,
 ):
     """Construct the reward function passed to GRPOTrainer.
@@ -122,6 +123,8 @@ def build_reward_funcs(
         raw_trace_jsonl: if set, log full per-completion stats here.
         routing_efficiency_bonus: small bonus per saved tool call, e.g. 0.05.
                                   reward = base + alpha * (3 - tool_calls) when correct.
+        tool_use_bonus: small bonus when the final answer is correct and the
+                        trajectory used at least one native tool call.
         is_main_process: only rank 0 should write the side-channel files.
     """
 
@@ -151,6 +154,8 @@ def build_reward_funcs(
             if base_correct and routing_efficiency_bonus > 0.0:
                 saved = max(0, 3 - int(stats["tool_calls"]))
                 base_reward = base_reward + routing_efficiency_bonus * saved
+            if base_correct and tool_use_bonus > 0.0 and int(stats["tool_calls"]) > 0:
+                base_reward = base_reward + tool_use_bonus
 
             rewards.append(float(base_reward))
 
@@ -179,6 +184,7 @@ def build_reward_funcs(
                     "tool_calls": int(stats["tool_calls"]),
                     "tool_msgs": int(stats["tool_msgs"]),
                     "tool_names_called": list(stats["tool_names_called"]),
+                    "tool_use_bonus": float(tool_use_bonus),
                 })
 
         if fail_rows and fail_buffer_jsonl:

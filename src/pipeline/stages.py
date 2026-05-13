@@ -19,23 +19,17 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..benchmarks.base import StandardRow
+from ..benchmarks.legalbench import load_legalbench
 from ..benchmarks.medqa import load_medqa
-from ..manager.evolve import (
-    EvolveSFTConfig,
-    ManagerSFTConfig,
-    build_manager_sft_from_failures,
-    train_manager_sft,
-)
-from ..manager.grpo_train import ManagerGRPOConfig, train_manager_grpo
 from ..manager.prompt import (
     build_manager_system_prompt,
     build_manager_user_message,
     parse_final_answer,
 )
-from ..subagents.runtime import FrozenSubagent, SubagentPool
-from ..subagents.schemas import AgentKind, SCHEMA_REGISTRY
-from ..subagents.synthesize import synthesize_subagent_data
-from ..subagents.train import SFTConfig, train_subagent_sft
+from ..subagents.prompts.extractor import build_extractor_synth_prompt
+from ..subagents.prompts.reasoner import build_reasoner_synth_prompt
+from ..subagents.prompts.rule_applier import build_rule_applier_synth_prompt
+from ..subagents.prompts.runtime_prompts import build_runtime_messages
 from ..teachers.base import TeacherClient, build_teacher_client
 from ..utils.cache import TeacherCallCache
 from ..utils.io import read_jsonl, write_json, write_jsonl
@@ -103,6 +97,23 @@ class StageContext:
 
 # --------------------- Helpers ---------------------
 
+def _agent_kind_value(agent_kind: Any) -> str:
+    return str(getattr(agent_kind, "value", agent_kind)).strip()
+
+
+def _build_local_teacher_prompt(
+    agent_kind: Any,
+    row: StandardRow,
+) -> List[Dict[str, str]]:
+    kind = _agent_kind_value(agent_kind)
+    if kind == "extractor":
+        return build_extractor_synth_prompt(row.question, row.context, row.choices)
+    if kind == "reasoner":
+        return build_reasoner_synth_prompt(row.question, row.context, row.choices)
+    if kind == "rule_applier":
+        return build_rule_applier_synth_prompt(row.question, row.context, row.choices)
+    raise ValueError(f"Unknown agent_kind: {agent_kind}")
+
 def _build_teacher(provider: str, model: str, ctx: StageContext) -> TeacherClient:
     teacher = build_teacher_client(provider=provider, model=model)
     ctx.teacher_provider = teacher.provider
@@ -169,6 +180,33 @@ def run_load_medqa(
     return rows
 
 
+def run_load_legalbench(
+    dataset_name: str = "nguha/legalbench",
+    configs: str = "",
+    split: str = "test",
+    hf_cache_dir: Optional[str] = None,
+    max_examples: int = 0,
+    max_labels: int = 12,
+    cache_normalized_path: Optional[str] = None,
+) -> List[StandardRow]:
+    rows, meta = load_legalbench(
+        dataset_name=dataset_name,
+        configs=configs,
+        split=split,
+        cache_dir=hf_cache_dir,
+        max_examples=max_examples,
+        max_labels=max_labels,
+    )
+    print(f"[LOAD_LEGALBENCH] loaded {len(rows)} rows from {dataset_name} split={split}")
+    if meta.get("skipped"):
+        print(f"[LOAD_LEGALBENCH] skipped {len(meta['skipped'])} configs")
+    if cache_normalized_path:
+        write_jsonl(cache_normalized_path, [r.to_dict() for r in rows])
+        write_json(cache_normalized_path + ".meta.json", meta)
+        print(f"[LOAD_LEGALBENCH] cached normalized rows -> {cache_normalized_path}")
+    return rows
+
+
 # --------------------- Stage: subagent SFT data synthesis ---------------------
 
 def run_synthesize_subagent(
@@ -180,9 +218,12 @@ def run_synthesize_subagent(
     n_samples: int = 500,
     base_temperature: float = 0.4,
     max_retries: int = 2,
-    show_gt_for_reasoner_and_rule: bool = True,
     use_cache: bool = True,
 ) -> Dict[str, Any]:
+    from ..subagents.schemas import AgentKind
+    from ..subagents.synthesize import synthesize_subagent_data
+
+    agent_kind = AgentKind(_agent_kind_value(agent_kind))
     teacher = _build_teacher(teacher_provider, teacher_model, ctx)
     cache = TeacherCallCache(ctx.cache_dir) if use_cache else None
     auditor = LeakageAuditor()
@@ -190,7 +231,6 @@ def run_synthesize_subagent(
     out_path = ctx.sft_jsonl_path(agent_kind.value)
     log_path = ctx.sft_log_path(agent_kind.value)
 
-    show_gt = show_gt_for_reasoner_and_rule  # synthesize.py overrides for Extractor anyway
     stats = synthesize_subagent_data(
         rows=rows,
         agent_kind=agent_kind,
@@ -198,7 +238,6 @@ def run_synthesize_subagent(
         out_path=out_path,
         cache=cache,
         auditor=auditor,
-        show_gt=show_gt,
         n_samples=n_samples,
         base_temperature=base_temperature,
         max_retries_per_sample=max_retries,
@@ -213,6 +252,215 @@ def run_synthesize_subagent(
         "out_path": out_path,
         "log_path": log_path,
         "stats": stats.__dict__,
+    }
+
+
+# --------------------- Stage: local DeepSeek JSONL bridge ---------------------
+
+def run_export_deepseek_subagent_prompts(
+    ctx: StageContext,
+    rows: List[StandardRow],
+    agent_kind: AgentKind,
+    out_path: Optional[str] = None,
+    n_samples: int = 500,
+) -> Dict[str, Any]:
+    """Write JSONL prompts for a local batch generator.
+
+    Each row is compatible with the patched DeepSeek `generate_jsonl.py`:
+      {"example_id": int, "prompt": [{"role": ..., "content": ...}, ...]}
+
+    Extra fields are intentionally included so `import_deepseek_subagent_responses`
+    can reconstruct validated SFT rows even if the generator output only keeps
+    example_id/prompt/response.
+    """
+    sample = list(rows)
+    random.Random(ctx.seed).shuffle(sample)
+    sample = sample[:n_samples] if n_samples > 0 else sample
+    kind_value = _agent_kind_value(agent_kind)
+
+    if out_path is None:
+        out_path = os.path.join(ctx.sft_data_root, f"{kind_value}_deepseek_prompts.jsonl")
+
+    out_rows: List[Dict[str, Any]] = []
+    for r in sample:
+        prompt = _build_local_teacher_prompt(
+            agent_kind,
+            r,
+        )
+        out_rows.append({
+            "example_id": int(r.example_id),
+            "benchmark_name": r.benchmark_name,
+            "agent_kind": kind_value,
+            "question": r.question,
+            "context": r.context,
+            "choices": dict(r.choices),
+            "ground_truth": r.ground_truth,
+            "prompt": prompt,
+        })
+
+    write_jsonl(out_path, out_rows)
+    return {"agent_kind": kind_value, "out_path": out_path, "n_rows": len(out_rows)}
+
+
+def run_import_deepseek_subagent_responses(
+    ctx: StageContext,
+    agent_kind: AgentKind,
+    prompt_jsonl: str,
+    response_jsonl: str,
+    out_path: Optional[str] = None,
+    log_path: Optional[str] = None,
+    teacher_model: str = "deepseek-local",
+    raw_responses: bool = False,
+) -> Dict[str, Any]:
+    """Convert local JSONL responses into subagent SFT rows.
+
+    By default responses are parsed, schema-validated, and leakage-audited. With
+    raw_responses=True, keep the teacher response text exactly as generated but
+    pair it with the runtime subagent prompt. This is useful for experiments
+    that intentionally train on unfiltered teacher outputs without teaching the
+    model the teacher-data-generation prompt.
+    """
+    from ..subagents.schemas import AgentKind
+    from ..subagents.synthesize import (
+        _extract_first_json,
+        _gt_audit_keywords,
+        _reasoner_choice_coverage_check,
+        _validate_schema,
+    )
+
+    agent_kind = AgentKind(_agent_kind_value(agent_kind))
+    kind_value = agent_kind.value
+    if out_path is None:
+        out_path = ctx.sft_jsonl_path(kind_value)
+    if log_path is None:
+        log_path = os.path.join(ctx.sft_data_root, f"{kind_value}_deepseek_import_log.jsonl")
+
+    prompt_rows = read_jsonl(prompt_jsonl)
+    response_rows = read_jsonl(response_jsonl)
+    prompt_by_id = {int(r["example_id"]): r for r in prompt_rows if r.get("example_id") is not None}
+
+    auditor = LeakageAuditor()
+    sft_rows: List[Dict[str, Any]] = []
+    log_rows: List[Dict[str, Any]] = []
+
+    for resp_row in response_rows:
+        eid = resp_row.get("example_id")
+        try:
+            eid_int = int(eid)
+        except Exception:
+            log_rows.append({"example_id": eid, "ok": False, "error": "missing_or_invalid_example_id"})
+            continue
+
+        src = prompt_by_id.get(eid_int)
+        if src is None:
+            log_rows.append({"example_id": eid_int, "ok": False, "error": "example_id_not_in_prompt_jsonl"})
+            continue
+
+        row = StandardRow(
+            example_id=eid_int,
+            benchmark_name=str(src.get("benchmark_name") or "medqa"),
+            task_subtype=str(src.get("task_subtype") or ""),
+            question=str(src.get("question") or ""),
+            choices=dict(src.get("choices") or {}),
+            ground_truth=str(src.get("ground_truth") or ""),
+            context=str(src.get("context") or ""),
+            metadata=dict(src.get("metadata") or {}),
+            split=str(src.get("split") or ""),
+        )
+
+        text = str(resp_row.get("response") or "")
+        runtime_prompt = build_runtime_messages(
+            agent_kind=kind_value,
+            question=row.question,
+            context=row.context,
+            choices=row.choices,
+        )
+        if raw_responses:
+            if not text.strip():
+                log_rows.append({"example_id": eid_int, "ok": False, "error": "empty_response"})
+                continue
+            sft_rows.append({
+                "example_id": eid_int,
+                "benchmark_name": row.benchmark_name,
+                "agent_kind": kind_value,
+                "teacher_provider": "raw_jsonl",
+                "teacher_model": teacher_model,
+                "prompt": runtime_prompt,
+                "response": text.strip(),
+            })
+            log_rows.append({"example_id": eid_int, "ok": True, "raw_response": True})
+            continue
+
+        obj = _extract_first_json(text)
+        if obj is None:
+            log_rows.append({
+                "example_id": eid_int,
+                "ok": False,
+                "error": "json_parse_fail",
+                "text_preview": text[:400],
+            })
+            continue
+
+        try:
+            model = _validate_schema(agent_kind, obj)
+        except Exception as e:
+            log_rows.append({
+                "example_id": eid_int,
+                "ok": False,
+                "error": "schema_fail",
+                "detail": str(e)[:400],
+            })
+            continue
+
+        ok_balance, balance_msg = _reasoner_choice_coverage_check(agent_kind, obj, row)
+        if not ok_balance:
+            log_rows.append({
+                "example_id": eid_int,
+                "ok": False,
+                "error": "balance_fail",
+                "detail": balance_msg,
+            })
+            continue
+
+        kw = _gt_audit_keywords(row)
+        audit = auditor.audit(
+            generated=obj,
+            ground_truth_label=kw["ground_truth_label"],
+            ground_truth_text=kw["ground_truth_text"],
+            token_form=kw["token_form"],
+        )
+        if audit.leaked:
+            log_rows.append({
+                "example_id": eid_int,
+                "ok": False,
+                "error": "leakage_fail",
+                "matches": audit.matches[:3],
+            })
+            continue
+
+        sft_rows.append({
+            "example_id": eid_int,
+            "benchmark_name": row.benchmark_name,
+            "agent_kind": kind_value,
+            "teacher_provider": "deepseek_local",
+            "teacher_model": teacher_model,
+            "prompt": runtime_prompt,
+            "response": json.dumps(model.model_dump(), ensure_ascii=False),
+        })
+        log_rows.append({"example_id": eid_int, "ok": True})
+
+    write_jsonl(out_path, sft_rows)
+    write_jsonl(log_path, log_rows)
+    return {
+        "agent_kind": kind_value,
+        "prompt_jsonl": prompt_jsonl,
+        "response_jsonl": response_jsonl,
+        "out_path": out_path,
+        "log_path": log_path,
+        "n_responses": len(response_rows),
+        "n_imported": len(sft_rows),
+        "n_failed": len(response_rows) - len(sft_rows),
+        "raw_responses": raw_responses,
     }
 
 
@@ -233,9 +481,12 @@ def run_train_subagent(
     lora_alpha: int = 32,
     max_steps: int = -1,
 ) -> Dict[str, Any]:
+    from ..subagents.train import SFTConfig, train_subagent_sft
+
+    kind_value = _agent_kind_value(agent_kind)
     if train_jsonl is None:
-        train_jsonl = ctx.sft_jsonl_path(agent_kind.value)
-    out_dir = ctx.adapter_path(agent_kind.value)
+        train_jsonl = ctx.sft_jsonl_path(kind_value)
+    out_dir = ctx.adapter_path(kind_value)
 
     cfg = SFTConfig(
         base_model=ctx.base_model,
@@ -254,7 +505,7 @@ def run_train_subagent(
         max_steps=max_steps,
     )
     train_subagent_sft(cfg)
-    return {"agent_kind": agent_kind.value, "adapter_dir": out_dir, "train_jsonl": train_jsonl}
+    return {"agent_kind": kind_value, "adapter_dir": out_dir, "train_jsonl": train_jsonl}
 
 
 # --------------------- Stage: manager GRPO ---------------------
@@ -262,6 +513,7 @@ def run_train_subagent(
 def run_train_manager_grpo(
     ctx: StageContext,
     train_rows: List[StandardRow],
+    manager_adapter: Optional[str] = None,
     extractor_adapter: Optional[str] = None,
     reasoner_adapter: Optional[str] = None,
     rule_applier_adapter: Optional[str] = None,
@@ -271,6 +523,7 @@ def run_train_manager_grpo(
     num_generations: int = 6,
     grpo_beta: float = 0.01,
     routing_efficiency_bonus: float = 0.0,
+    tool_use_bonus: float = 0.0,
     max_steps: int = -1,
     use_wandb: bool = False,
     wandb_project: str = "agent_routing",
@@ -278,6 +531,8 @@ def run_train_manager_grpo(
     wandb_run_name: str = "",
     task_description: str = "",
 ) -> Dict[str, Any]:
+    from ..manager.grpo_train import ManagerGRPOConfig, train_manager_grpo
+
     out_dir = ctx.manager_grpo_dir()
     cfg = ManagerGRPOConfig(
         base_model=ctx.base_model,
@@ -286,6 +541,7 @@ def run_train_manager_grpo(
         extractor_adapter=extractor_adapter or ctx.adapter_path("extractor"),
         reasoner_adapter=reasoner_adapter or ctx.adapter_path("reasoner"),
         rule_applier_adapter=rule_applier_adapter or ctx.adapter_path("rule_applier"),
+        manager_adapter=manager_adapter,
         fail_buffer_jsonl=ctx.fail_buffer_path(),
         raw_trace_jsonl=os.path.join(out_dir, "train_raw_trace.jsonl"),
         seed=ctx.seed,
@@ -296,6 +552,7 @@ def run_train_manager_grpo(
         grpo_beta=grpo_beta,
         max_steps=max_steps,
         routing_efficiency_bonus=routing_efficiency_bonus,
+        tool_use_bonus=tool_use_bonus,
         binding_mode=ctx.binding_mode,
         use_wandb=use_wandb,
         wandb_project=wandb_project,
@@ -318,6 +575,8 @@ def run_evolve_build_sft(
     max_fail_samples: int = 1500,
     task_description: str = "",
 ) -> Dict[str, Any]:
+    from ..manager.evolve import EvolveSFTConfig, build_manager_sft_from_failures
+
     teacher = None
     if teacher_provider and teacher_model:
         teacher = _build_teacher(teacher_provider, teacher_model, ctx)
@@ -342,6 +601,38 @@ def run_evolve_build_sft(
     return {"sft_jsonl": out_path, "out_dir": out_dir}
 
 
+def run_manager_coldstart_sft(
+    ctx: StageContext,
+    rows: List[StandardRow],
+    teacher_provider: Optional[str] = None,
+    teacher_model: Optional[str] = None,
+    n_samples: int = 300,
+    task_description: str = "",
+) -> Dict[str, Any]:
+    from ..manager.evolve import ColdStartSFTConfig, build_manager_sft_from_rows
+
+    teacher = None
+    if teacher_provider and teacher_model:
+        teacher = _build_teacher(teacher_provider, teacher_model, ctx)
+
+    out_dir = ctx.evolve_dir()
+    cfg = ColdStartSFTConfig(
+        base_model=ctx.base_model,
+        extractor_adapter=ctx.adapter_path("extractor"),
+        reasoner_adapter=ctx.adapter_path("reasoner"),
+        rule_applier_adapter=ctx.adapter_path("rule_applier"),
+        rows=rows,
+        out_dir=out_dir,
+        teacher=teacher,
+        seed=ctx.seed,
+        n_samples=n_samples,
+        binding_mode=("argument" if ctx.binding_mode == "argument" else "environment"),
+        task_description=task_description,
+    )
+    out_path = build_manager_sft_from_rows(cfg)
+    return {"sft_jsonl": out_path, "out_dir": out_dir}
+
+
 # --------------------- Stage: manager SFT (post-evolve) ---------------------
 
 def run_train_manager_sft(
@@ -357,6 +648,8 @@ def run_train_manager_sft(
     lora_alpha: int = 32,
     max_steps: int = -1,
 ) -> Dict[str, Any]:
+    from ..manager.evolve import ManagerSFTConfig, train_manager_sft
+
     if train_jsonl is None:
         train_jsonl = os.path.join(ctx.evolve_dir(), "manager_sft_from_failures.jsonl")
     if not os.path.exists(train_jsonl):
@@ -432,6 +725,8 @@ def run_eval_subagents(
     schema validation. This is the basic 'is the subagent functional' check.
     """
     import torch
+    from ..subagents.runtime import FrozenSubagent, SubagentPool
+    from ..subagents.schemas import AgentKind, SCHEMA_REGISTRY
 
     set_seed(ctx.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -444,7 +739,8 @@ def run_eval_subagents(
     }
 
     pool = SubagentPool()
-    for kind in agent_kinds:
+    kinds = [AgentKind(_agent_kind_value(k)) for k in agent_kinds]
+    for kind in kinds:
         adapter = ctx.adapter_path(kind.value)
         if not os.path.exists(adapter):
             print(f"[EVAL] adapter missing for {kind.value}: {adapter}; skipping.")
@@ -454,7 +750,7 @@ def run_eval_subagents(
     out_log_path = os.path.join(ctx.eval_root, "subagent_eval.jsonl")
     rows_log: List[Dict[str, Any]] = []
 
-    for kind in agent_kinds:
+    for kind in kinds:
         if not pool.has(kind.value):
             continue
         n_total, n_json_ok, n_schema_ok = 0, 0, 0

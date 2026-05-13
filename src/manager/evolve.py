@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -160,6 +161,126 @@ class EvolveSFTConfig:
     task_description: str = ""
 
 
+def _register_available_subagents(
+    base_model: str,
+    extractor_adapter: Optional[str],
+    reasoner_adapter: Optional[str],
+    rule_applier_adapter: Optional[str],
+    device: str,
+) -> tuple[SubagentPool, List[str]]:
+    pool = SubagentPool()
+    available_kinds: List[str] = []
+    if extractor_adapter:
+        pool.register(FrozenSubagent(base_model, extractor_adapter, "extractor", device))
+        available_kinds.append("extractor")
+    if reasoner_adapter:
+        pool.register(FrozenSubagent(base_model, reasoner_adapter, "reasoner", device))
+        available_kinds.append("reasoner")
+    if rule_applier_adapter:
+        pool.register(FrozenSubagent(base_model, rule_applier_adapter, "rule_applier", device))
+        available_kinds.append("rule_applier")
+    return pool, available_kinds
+
+
+def _coldstart_fallback_sequence(idx: int, context: str, available_kinds: List[str]) -> List[str]:
+    available_tools = {k + "_tool" for k in available_kinds}
+    if context and len(context) > 800 and "extractor_tool" in available_tools:
+        seq = ["extractor_tool", "reasoner_tool"]
+    elif idx % 5 == 0 and "extractor_tool" in available_tools:
+        seq = ["extractor_tool", "reasoner_tool"]
+    elif idx % 5 == 1 and "rule_applier_tool" in available_tools:
+        seq = ["rule_applier_tool", "reasoner_tool"]
+    else:
+        seq = ["reasoner_tool"]
+    return [t for t in seq if t in available_tools][:3]
+
+
+def _build_manager_tool_sft_rows(
+    rows: List[StandardRow],
+    pool: SubagentPool,
+    available_kinds: List[str],
+    teacher: Optional[TeacherClient],
+    binding_mode: str,
+    task_description: str,
+    cache_namespace: str,
+) -> List[Dict[str, Any]]:
+    sft_rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        eid = int(row.example_id)
+        sys_prompt = build_manager_system_prompt(
+            label_keys=list(row.choices.keys()),
+            task_description=task_description,
+        )
+        user_msg = build_manager_user_message(
+            example_id=eid,
+            question=row.question,
+            context=row.context,
+            choices=row.choices,
+            binding_mode=binding_mode,
+        )
+        base_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+
+        fallback_seq = _coldstart_fallback_sequence(idx, row.context, available_kinds)
+        seq = _teacher_choose_tool_sequence(
+            teacher=teacher,
+            question=row.question,
+            context=row.context,
+            choices=row.choices,
+            available_kinds=available_kinds,
+            fallback_seq=fallback_seq,
+        )
+
+        tool_outputs: Dict[str, str] = {}
+        for tname in seq:
+            kind = _TOOL_NAME_TO_KIND[tname]
+            if not pool.has(kind):
+                continue
+            tool_outputs[tname] = pool.call(
+                agent_kind=kind,
+                example_id=eid,
+                question=row.question,
+                context=row.context,
+                choices=row.choices,
+                cache_namespace=cache_namespace,
+            )
+
+        final_text = _final_answer_str(row.ground_truth)
+        if not seq:
+            sft_rows.append({
+                "example_id": eid,
+                "prompt": base_messages,
+                "response": [{"role": "assistant", "content": final_text}],
+            })
+            continue
+
+        history = list(base_messages)
+        for i, tname in enumerate(seq):
+            call_id = f"call_{eid}_{i+1}"
+            asst_call = _tool_call_message(tname, eid, call_id, binding_mode)
+            sft_rows.append({
+                "example_id": eid,
+                "prompt": list(history),
+                "response": [asst_call],
+            })
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tname,
+                "content": tool_outputs.get(tname, '{"error":"tool_not_available"}'),
+            }
+            history = history + [asst_call, tool_msg]
+
+        sft_rows.append({
+            "example_id": eid,
+            "prompt": list(history),
+            "response": [{"role": "assistant", "content": final_text}],
+        })
+    return sft_rows
+
+
 def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
     """Read fail buffer, build per-turn SFT trajectories, write to disk.
 
@@ -172,18 +293,13 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
     os.makedirs(cfg.out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Build pool from available adapters.
-    pool = SubagentPool()
-    available_kinds: List[str] = []
-    if cfg.extractor_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.extractor_adapter, "extractor", device))
-        available_kinds.append("extractor")
-    if cfg.reasoner_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.reasoner_adapter, "reasoner", device))
-        available_kinds.append("reasoner")
-    if cfg.rule_applier_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.rule_applier_adapter, "rule_applier", device))
-        available_kinds.append("rule_applier")
+    pool, available_kinds = _register_available_subagents(
+        cfg.base_model,
+        cfg.extractor_adapter,
+        cfg.reasoner_adapter,
+        cfg.rule_applier_adapter,
+        device,
+    )
 
     row_index = {int(r.example_id): r for r in cfg.rows}
 
@@ -211,77 +327,16 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
 
     print(f"[EVOLVE] {len(fails)} unique failed example_ids selected from buffer.")
 
-    sft_rows: List[Dict[str, Any]] = []
-    for eid in fails:
-        row = row_index[eid]
-        sys_prompt = build_manager_system_prompt(
-            label_keys=list(row.choices.keys()),
-            task_description=cfg.task_description,
-        )
-        user_msg = build_manager_user_message(
-            example_id=eid, question=row.question,
-            context=row.context, choices=row.choices,
-            binding_mode=cfg.binding_mode,
-        )
-        base_messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_msg},
-        ]
-
-        seq = _teacher_choose_tool_sequence(
-            teacher=cfg.teacher,
-            question=row.question,
-            context=row.context,
-            choices=row.choices,
-            available_kinds=available_kinds,
-        )
-
-        # Pre-fetch tool outputs for the chosen sequence
-        tool_outputs: Dict[str, str] = {}
-        for tname in seq:
-            kind = _TOOL_NAME_TO_KIND[tname]
-            if not pool.has(kind):
-                continue
-            tool_outputs[tname] = pool.call(
-                agent_kind=kind, example_id=eid,
-                question=row.question, context=row.context, choices=row.choices,
-                cache_namespace="evolve",
-            )
-
-        final_text = _final_answer_str(row.ground_truth)
-
-        if not seq:
-            sft_rows.append({
-                "example_id": eid,
-                "prompt": base_messages,
-                "response": [{"role": "assistant", "content": final_text}],
-            })
-            continue
-
-        # Walk turns
-        history = list(base_messages)
-        for i, tname in enumerate(seq):
-            call_id = f"call_{eid}_{i+1}"
-            asst_call = _tool_call_message(tname, eid, call_id, cfg.binding_mode)
-            sft_rows.append({
-                "example_id": eid,
-                "prompt": list(history),
-                "response": [asst_call],
-            })
-            tool_msg = {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": tname,
-                "content": tool_outputs.get(tname, '{"error":"tool_not_available"}'),
-            }
-            history = history + [asst_call, tool_msg]
-
-        # Final answer turn
-        sft_rows.append({
-            "example_id": eid,
-            "prompt": list(history),
-            "response": [{"role": "assistant", "content": final_text}],
-        })
+    selected_rows = [row_index[eid] for eid in fails]
+    sft_rows = _build_manager_tool_sft_rows(
+        rows=selected_rows,
+        pool=pool,
+        available_kinds=available_kinds,
+        teacher=cfg.teacher,
+        binding_mode=cfg.binding_mode,
+        task_description=cfg.task_description,
+        cache_namespace="evolve",
+    )
 
     out_path = os.path.join(cfg.out_dir, "manager_sft_from_failures.jsonl")
     write_jsonl(out_path, sft_rows)
@@ -294,6 +349,65 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
         "teacher_model": cfg.teacher.model if cfg.teacher else "",
     })
     print(f"[EVOLVE] wrote {len(sft_rows)} SFT rows -> {out_path}")
+    return out_path
+
+
+@dataclass
+class ColdStartSFTConfig:
+    base_model: str
+    extractor_adapter: Optional[str]
+    reasoner_adapter: Optional[str]
+    rule_applier_adapter: Optional[str]
+    rows: List[StandardRow]
+    out_dir: str
+    teacher: Optional[TeacherClient] = None
+    seed: int = 42
+    n_samples: int = 300
+    binding_mode: str = "environment"
+    task_description: str = ""
+
+
+def build_manager_sft_from_rows(cfg: ColdStartSFTConfig) -> str:
+    """Build manager tool-call SFT rows from ordinary training examples."""
+    set_seed(cfg.seed)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pool, available_kinds = _register_available_subagents(
+        cfg.base_model,
+        cfg.extractor_adapter,
+        cfg.reasoner_adapter,
+        cfg.rule_applier_adapter,
+        device,
+    )
+    if not available_kinds:
+        raise ValueError("No subagent adapters available for cold-start SFT.")
+
+    sample = list(cfg.rows)
+    random.Random(cfg.seed).shuffle(sample)
+    if cfg.n_samples > 0:
+        sample = sample[:cfg.n_samples]
+
+    sft_rows = _build_manager_tool_sft_rows(
+        rows=sample,
+        pool=pool,
+        available_kinds=available_kinds,
+        teacher=cfg.teacher,
+        binding_mode=cfg.binding_mode,
+        task_description=cfg.task_description,
+        cache_namespace="coldstart",
+    )
+
+    out_path = os.path.join(cfg.out_dir, "manager_sft_coldstart.jsonl")
+    write_jsonl(out_path, sft_rows)
+    write_json(os.path.join(cfg.out_dir, "coldstart_run_config.json"), {
+        "n_examples": len(sample),
+        "n_sft_rows": len(sft_rows),
+        "available_kinds": available_kinds,
+        "binding_mode": cfg.binding_mode,
+        "teacher_provider": cfg.teacher.provider if cfg.teacher else "heuristic",
+        "teacher_model": cfg.teacher.model if cfg.teacher else "",
+    })
+    print(f"[COLDSTART] wrote {len(sft_rows)} SFT rows from {len(sample)} examples -> {out_path}")
     return out_path
 
 

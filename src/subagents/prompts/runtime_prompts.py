@@ -1,8 +1,8 @@
 """Runtime system prompts (used at inference, AFTER subagent SFT).
 
 These are the same shape as the teacher synthesis prompts, but stripped of
-PRIVATE_GT and the meta-explanation. The trained subagent should be able to
-follow these directly.
+teacher-facing meta-explanation. The trained subagent should be able to follow
+these directly.
 """
 from __future__ import annotations
 
@@ -30,21 +30,23 @@ Rules:
 
 REASONER_RUNTIME_SYSTEM = """You are the Reasoner sub-agent.
 
-Given a question (and choices, optional context), produce a structured reasoning scaffold. Output ONLY a JSON object with this schema:
+Given a question (and choices, optional context), produce a short neutral scaffold. Output ONLY a JSON object with this schema:
 {
-  "sub_questions": [str],
-  "required_knowledge": [str],
-  "reasoning_chain": [str],
-  "candidate_analysis": [{"choice_key": str, "support": str, "against": str}],
-  "uncertainty_notes": [str],
-  "confidence": float
+  "case_facts": [str],
+  "task_type": str,
+  "decision_factors": [str],
+  "knowledge_slots": [str],
+  "candidate_considerations": [{"choice_key": str, "relevant_if": [str], "less_relevant_if": [str]}],
+  "missing_information": [str],
+  "format_confidence": float
 }
 
 Rules:
 - Output ONLY valid JSON.
 - NEVER state the final answer or which choice is correct.
-- candidate_analysis must cover ALL choice keys with balanced support/against.
-- reasoning_chain is a sequence of cognitive steps, not conclusions.
+- candidate_considerations must cover ALL choice keys.
+- Use conditional relevant_if / less_relevant_if fields, not support/against.
+- Keep the response short and neutral.
 """
 
 

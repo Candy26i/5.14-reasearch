@@ -57,30 +57,36 @@ class ExtractorOutput(BaseModel):
 
 # ---------- Reasoner ----------
 
-class CandidateAnalysis(BaseModel):
-    """Per-choice pros/cons, used when the input is MCQ.
+class CandidateConsideration(BaseModel):
+    """Neutral per-choice conditions, used when the input is MCQ.
 
-    The `choice_key` is a label like "A","B","yes","no". The `support` and
-    `against` strings must NOT contain the final answer disclosure
-    (e.g. "this is the correct answer"). The leakage auditor checks this.
+    This is intentionally weaker than support/against. The goal is to teach a
+    small subagent to map each option to conditions under which it matters,
+    without making one option read like the answer.
     """
     choice_key: str = Field(..., max_length=16)
-    support: str = Field(default="", max_length=300)
-    against: str = Field(default="", max_length=300)
+    relevant_if: List[str] = Field(default_factory=list, max_length=3)
+    less_relevant_if: List[str] = Field(default_factory=list, max_length=3)
+
+    @field_validator("relevant_if", "less_relevant_if")
+    @classmethod
+    def _trim_conditionals(cls, v: List[str]) -> List[str]:
+        return [str(s)[:180].strip() for s in v if str(s).strip()]
 
 
 class ReasonerOutput(BaseModel):
-    sub_questions: List[str] = Field(default_factory=list, max_length=6)
-    required_knowledge: List[str] = Field(default_factory=list, max_length=8)
-    reasoning_chain: List[str] = Field(default_factory=list, max_length=8)
-    candidate_analysis: List[CandidateAnalysis] = Field(default_factory=list, max_length=8)
-    uncertainty_notes: List[str] = Field(default_factory=list, max_length=4)
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    case_facts: List[str] = Field(default_factory=list, max_length=8)
+    task_type: str = Field(default="", max_length=64)
+    decision_factors: List[str] = Field(default_factory=list, max_length=8)
+    knowledge_slots: List[str] = Field(default_factory=list, max_length=6)
+    candidate_considerations: List[CandidateConsideration] = Field(default_factory=list, max_length=8)
+    missing_information: List[str] = Field(default_factory=list, max_length=4)
+    format_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
-    @field_validator("sub_questions", "required_knowledge", "reasoning_chain", "uncertainty_notes")
+    @field_validator("case_facts", "decision_factors", "knowledge_slots", "missing_information")
     @classmethod
     def _trim_lines(cls, v: List[str]) -> List[str]:
-        return [str(s)[:300].strip() for s in v if str(s).strip()]
+        return [str(s)[:220].strip() for s in v if str(s).strip()]
 
 
 # ---------- Rule Applier ----------
