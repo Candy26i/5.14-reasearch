@@ -291,8 +291,14 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
     """
     set_seed(cfg.seed)
     os.makedirs(cfg.out_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
     pool, available_kinds = _register_available_subagents(
         cfg.base_model,
         cfg.extractor_adapter,
@@ -371,7 +377,13 @@ def build_manager_sft_from_rows(cfg: ColdStartSFTConfig) -> str:
     """Build manager tool-call SFT rows from ordinary training examples."""
     set_seed(cfg.seed)
     os.makedirs(cfg.out_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"  
     pool, available_kinds = _register_available_subagents(
         cfg.base_model,
         cfg.extractor_adapter,
@@ -476,7 +488,14 @@ def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> 
 
 def train_manager_sft(cfg: ManagerSFTConfig) -> None:
     set_seed(cfg.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
 
     tok = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True)
     tok.padding_side = "left"
