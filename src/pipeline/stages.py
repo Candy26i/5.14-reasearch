@@ -733,7 +733,14 @@ def run_eval_subagents(
     from ..subagents.schemas import AgentKind, SCHEMA_REGISTRY
 
     set_seed(ctx.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
     sample = list(rows)
     random.Random(ctx.seed).shuffle(sample)
     sample = sample[:n_samples]
@@ -828,7 +835,13 @@ def run_eval_manager(
         raise FileNotFoundError(f"manager_dir not found: {manager_dir}")
 
     set_seed(ctx.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
     sample = list(rows)
     random.Random(ctx.seed).shuffle(sample)
     sample = sample[:n_samples]
@@ -838,7 +851,7 @@ def run_eval_manager(
         tok.pad_token_id = tok.eos_token_id
     tok.padding_side = "left"
 
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     is_full = (
         os.path.exists(os.path.join(manager_dir, "config.json"))
@@ -1069,14 +1082,22 @@ def run_eval_manager_tools(
         user_binding_mode = "argument"
 
     set_seed(ctx.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
+    # dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     pool = SubagentPool()
+    subagent_base_model = "Qwen/Qwen3-4B"
     for kind in ("extractor", "reasoner", "rule_applier"):
         adapter = ctx.adapter_path(kind)
         if os.path.exists(adapter):
-            pool.register(FrozenSubagent(ctx.base_model, adapter, kind, device))
+            pool.register(FrozenSubagent(subagent_base_model, adapter, kind, device))
     if not pool._agents:
         raise FileNotFoundError(f"No subagent adapters found under {ctx.adapter_root}")
 
