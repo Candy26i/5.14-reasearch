@@ -208,8 +208,14 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         raise RuntimeError("trl is required for manager GRPO training.")
 
     set_seed(cfg.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
     # ---- Resolve binding mode ----
     binding_mode = cfg.binding_mode
     if binding_mode == "auto":
@@ -219,15 +225,16 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
             "binding_mode=environment requires a TRL version with environment_factory."
         )
     print(f"[MANAGER_GRPO] binding_mode={binding_mode}")
-
+    subagent_base_model = "Qwen/Qwen3-4B"
+    print(f"[MANAGER_GRPO] subagent_base_model={subagent_base_model}")
     # ---- Build subagent pool ----
     pool = SubagentPool()
     if cfg.extractor_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.extractor_adapter, "extractor", device))
+        pool.register(FrozenSubagent(subagent_base_model, cfg.extractor_adapter, "extractor", device))
     if cfg.reasoner_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.reasoner_adapter, "reasoner", device))
+        pool.register(FrozenSubagent(subagent_base_model, cfg.reasoner_adapter, "reasoner", device))
     if cfg.rule_applier_adapter:
-        pool.register(FrozenSubagent(cfg.base_model, cfg.rule_applier_adapter, "rule_applier", device))
+        pool.register(FrozenSubagent(subagent_base_model, cfg.rule_applier_adapter, "rule_applier", device))
     if not pool._agents:
         raise ValueError("At least one subagent adapter must be provided.")
     print(f"[MANAGER_GRPO] subagents loaded: {sorted(pool._agents.keys())}")
@@ -305,46 +312,61 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
             manager_tok = add_response_schema(manager_tok)
         except Exception:
             pass
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
     is_full_init = (
         cfg.manager_adapter
         and os.path.isdir(cfg.manager_adapter)
         and os.path.exists(os.path.join(cfg.manager_adapter, "config.json"))
         and not os.path.exists(os.path.join(cfg.manager_adapter, "adapter_config.json"))
     )
+
     if cfg.full_parameter_rl and is_full_init:
         manager_model = AutoModelForCausalLM.from_pretrained(
-            cfg.manager_adapter, torch_dtype=dtype, trust_remote_code=True
-        ).to(device)
+            cfg.manager_adapter,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map={"": device},
+        )
         print(f"[MANAGER_GRPO] full-parameter init model -> {cfg.manager_adapter}")
+
     else:
         manager_model = AutoModelForCausalLM.from_pretrained(
-            cfg.base_model, torch_dtype=dtype, trust_remote_code=True
-        ).to(device)
+            cfg.base_model,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map={"": device},
+        )
+
         if cfg.manager_adapter:
             if not PEFT_AVAILABLE:
                 raise RuntimeError("peft is required to load --mgr_init_adapter.")
+
             manager_model = PeftModel.from_pretrained(
                 manager_model,
                 cfg.manager_adapter,
                 is_trainable=(not cfg.full_parameter_rl),
-            ).to(device)
+            )
+
             if cfg.full_parameter_rl:
-                manager_model = manager_model.merge_and_unload().to(device)
+                manager_model = manager_model.merge_and_unload()
                 print(f"[MANAGER_GRPO] merged init adapter for full-parameter RL -> {cfg.manager_adapter}")
             else:
                 print(f"[MANAGER_GRPO] manager init adapter -> {cfg.manager_adapter}")
+
     if cfg.full_parameter_rl:
         for p in manager_model.parameters():
             p.requires_grad_(True)
         trainable = sum(p.numel() for p in manager_model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in manager_model.parameters())
         print(f"[MANAGER_GRPO] full_parameter_rl=True trainable_params={trainable}/{total}")
+
     manager_model.config.use_cache = False
+
     if not hasattr(manager_model, "warnings_issued") or manager_model.warnings_issued is None:
         manager_model.warnings_issued = {}
-
     # ---- GRPO config ----
     grpo_args = GRPOConfig(
         output_dir=cfg.out_dir,
